@@ -1,0 +1,72 @@
+name: 'Setup Bedrock Authentication'
+description: 'Configure GitHub App token, AWS credentials, and discover Claude Model ARN for Bedrock'
+
+inputs:
+  github-app-id:
+    description: 'GitHub App ID'
+    required: true
+  github-app-private-key:
+    description: 'GitHub App Private Key'
+    required: true
+  aws-iam-role:
+    description: 'AWS IAM Role ARN to assume'
+    required: true
+  aws-region:
+    description: 'AWS Region'
+    required: false
+    default: 'us-east-1'
+
+outputs:
+  github-token:
+    description: 'GitHub App token for API access'
+    value: ${{ steps.app-token.outputs.token }}
+  model-arn:
+    description: 'Claude Model ARN for Bedrock'
+    value: ${{ steps.discover-model.outputs.profile_arn }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate GitHub App token
+      id: app-token
+      uses: actions/create-github-app-token@67018539274d69449ef7c02e8e71183d1719ab42 # v2.1.4
+      with:
+        app-id: ${{ inputs.github-app-id }}
+        private-key: ${{ inputs.github-app-private-key }}
+
+    - name: Configure AWS credentials
+      id: configure-aws-credentials
+      uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502    # v4
+      with:
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: ${{ github.event.repository.name }}
+        role-to-assume: ${{ inputs.aws-iam-role }}
+
+    - name: Discover Claude Model ARN
+      id: discover-model
+      shell: bash
+      run: |
+        set +x  # Disable command echoing for security
+        REPO_NAME="${{ github.event.repository.name }}"
+
+        # Get the current AWS account ID (suppress output)
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
+
+        # Mask the account ID in logs
+        echo "::add-mask::$ACCOUNT_ID"
+
+        # Find the inference profile (suppress output)
+        PROFILE_ID=$(aws bedrock list-inference-profiles --type-equals APPLICATION 2>/dev/null | jq -r '.inferenceProfileSummaries | [.[] | select(.inferenceProfileName | contains("dp-gh-repo-'$REPO_NAME'-prod")) | .inferenceProfileId][0]' 2>/dev/null)
+
+        if [ "$PROFILE_ID" = "null" ] || [ -z "$PROFILE_ID" ]; then
+          echo "Error: Could not find inference profile for repository: $REPO_NAME"
+          exit 1
+        fi
+
+        # Construct the full ARN using the discovered account ID
+        FULL_PROFILE_ARN="arn:aws:bedrock:${{ inputs.aws-region }}:${ACCOUNT_ID}:application-inference-profile/${PROFILE_ID}"
+        echo "Successfully discovered model configuration for repository: $REPO_NAME"
+
+        # Mask the model ARN in logs
+        echo "::add-mask::$FULL_PROFILE_ARN"
+        echo "profile_arn=$FULL_PROFILE_ARN" >> $GITHUB_OUTPUT

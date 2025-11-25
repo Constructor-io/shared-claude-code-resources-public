@@ -1,0 +1,108 @@
+name: Claude Code PR Review
+
+# Trigger conditions: Run when a PR is opened, marked ready for review, or updated with new commits
+on:
+  pull_request:
+    types: [opened, ready_for_review, synchronize]
+  workflow_call: # to allow other workflows to call this workflow
+
+# Prevent multiple simultaneous reviews on same PR
+# If a new commit is pushed while review is running, cancel the old review and start fresh
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    # Conditional logic to determine when to run the review:
+    # - Skip draft PRs (not ready for review)
+    # - Skip bot-created PRs (automated changes don't need AI review)
+    # - Skip PRs with [skip review] in title (manual opt-out)
+    # - Only run for trusted contributors. Check if the PR is from the same repository (not a fork).
+    if: |
+      !github.event.pull_request.draft &&
+      !contains(github.event.pull_request.title, '[skip review]') &&
+      github.event.pull_request.user.type != 'Bot' &&
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+    permissions:
+      contents: read # Read repository files
+      pull-requests: read # Read PR metadata and diffs
+      issues: read # Read linked issues (PRs are issues in GitHub API)
+      id-token: write # Generate OIDC token for secure authentication
+      actions: read # Read CI/CD workflow results on PRs
+
+    steps:
+      # Using shallow fetch (depth=1) for performance - only need current state, not full history
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Bedrock Authentication
+        id: auth
+        uses: Constructor-io/shared-claude-code-resources/.github/actions/setup-bedrock-auth@main
+        with:
+          github-app-id: ${{ secrets.CLAUDE_BEDROCK_APP_ID}}
+          github-app-private-key: ${{ secrets.CLAUDE_BEDROCK_APP_PRIVATE_KEY }}
+          aws-iam-role: ${{ secrets.CLAUDE_BEDROCK_IAM_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@f30f5eecfce2f34fa72e40fa5f7bcdbdcad12eb8 # v1
+        env:
+          ANTHROPIC_MODEL: ${{ steps.auth.outputs.model-arn }}
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ steps.auth.outputs.model-arn }}
+        with:
+          github_token: ${{ steps.auth.outputs.github-token }}
+          use_bedrock: true
+          prompt: |
+            <role>
+            You are an expert senior software engineer acting as a code reviewer. Your goal is to help your team write clean, maintainable, and bug-free code.
+            </role>
+
+            <context>
+            - Repository: ${{ github.repository }}
+            - PR number: ${{ github.event.pull_request.number }}
+            - Use `gh pr view` to get PR details if needed
+            - Use `gh pr diff` to get the diff of the PR and identify all the changed files for the analysis.
+            </context>
+
+            <task>
+            Your task is to perform a thorough review of the code changes in this pull request. Use the available tools to understand the context and the diff.
+            Use the guidelines from ".claude/commands/review.md" and the repository's CLAUDE.md for guidance on style and conventions.
+            Be constructive and helpful in your feedback.
+            </task>
+
+            <instructions>
+            1.  **Analyze the changes**: Use the `gh pr diff` tool to get the full context of the code changes.
+            2.  **Apply Guidelines**: You MUST strictly follow the detailed review guidelines located in `.claude/commands/review.md` and the repository's general style guide in `CLAUDE.md`.
+            3.  **Be Actionable**: Provide specific, constructive feedback. For any issues you find, explain *why* it's an issue and suggest a concrete improvement. Include code snippets where helpful.
+            4.  **Handle No Issues**: If the code is high-quality and you find no issues, leave a brief, positive comment and approve the changes.
+            </instructions>
+
+            <output_format>
+            You MUST deliver your complete review as a single comment on the pull request using the `gh pr comment` tool.
+
+            If a different output format is requested in the `.claude/commands/review.md` file, follow that structure. If not structure your review using the following markdown format:
+
+            ### Code Review Summary
+            A brief, high-level overview of the pull request and your findings.
+
+            ### Detailed Feedback
+            - **[File: `path/to/file.js` Line: `L15`]** A specific, actionable comment about a line of code.
+            - **[General]** A comment that applies to the PR as a whole.
+
+            ### Conclusion
+            A final closing statement.
+            </output_format>
+
+            You MUST deliver your complete review as a single comment on the pull request using the `gh pr comment` tool. Only use this method and no other method.
+
+          # Restrict Claude's tool access for security - only allow read-only GitHub/git commands
+          # Allows: viewing PRs/issues, reading diffs, and posting comments
+          # Prevents: modifying code, merging PRs, or running arbitrary commands
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(git log:*),Bash(git diff:*)"'
