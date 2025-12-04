@@ -43,7 +43,7 @@ jobs:
 
       - name: Setup Bedrock Authentication
         id: auth
-        uses: Constructor-io/shared-claude-code-resources/.github/actions/setup-bedrock-auth@main
+        uses: Constructor-io/shared-claude-code-resources-public/.github/actions/setup-bedrock-auth@main
         with:
           github-app-id: ${{ secrets.CLAUDE_BEDROCK_APP_ID}}
           github-app-private-key: ${{ secrets.CLAUDE_BEDROCK_APP_PRIVATE_KEY }}
