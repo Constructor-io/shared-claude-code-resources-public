@@ -5,6 +5,11 @@ on:
   pull_request:
     types: [opened, ready_for_review, synchronize]
   workflow_call: # to allow other workflows to call this workflow
+    inputs:
+      hide_previous_comments:
+        description: 'Hide previous bot review comments before posting new one'
+        type: boolean
+        default: false
 
 # Prevent multiple simultaneous reviews on same PR
 # If a new commit is pushed while review is running, cancel the old review and start fresh
@@ -49,6 +54,51 @@ jobs:
           github-app-private-key: ${{ secrets.CLAUDE_BEDROCK_APP_PRIVATE_KEY }}
           aws-iam-role: ${{ secrets.CLAUDE_BEDROCK_IAM_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Hide previous review comments
+        if: ${{ inputs.hide_previous_comments == true }}
+        env:
+          GH_TOKEN: ${{ steps.auth.outputs.github-token }}
+        run: |
+          BOT_LOGIN="constructor-claude-bedrock"
+          echo "Looking for comments from: $BOT_LOGIN"
+
+          COMMENTS=$(gh api graphql -f query='
+            query($owner: String!, $repo: String!, $number: Int!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                  comments(first: 100) {
+                    nodes {
+                      id
+                      author { login }
+                      isMinimized
+                    }
+                  }
+                }
+              }
+            }
+          ' -f owner='${{ github.repository_owner }}' \
+            -f repo='${{ github.event.repository.name }}' \
+            -F number=${{ github.event.pull_request.number }} \
+            --jq ".data.repository.pullRequest.comments.nodes[] | select(.author.login == \"$BOT_LOGIN\" and .isMinimized == false) | .id")
+
+          if [ -z "$COMMENTS" ]; then
+            echo "No previous comments to hide"
+            exit 0
+          fi
+
+          for COMMENT_ID in $COMMENTS; do
+            echo "Minimizing comment: $COMMENT_ID"
+            gh api graphql -f query='
+              mutation($id: ID!) {
+                minimizeComment(input: { subjectId: $id, classifier: OUTDATED }) {
+                  minimizedComment { isMinimized }
+                }
+              }
+            ' -f id="$COMMENT_ID" || echo "Warning: Failed to minimize $COMMENT_ID"
+          done
+
+          echo "Finished hiding previous comments"
 
       - name: Run Claude Code Review
         id: claude-review
