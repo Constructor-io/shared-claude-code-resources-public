@@ -1,0 +1,42 @@
+name: 'Post Inline Review'
+description: 'Post a code review to a GitHub PR with inline comments'
+
+inputs:
+  github-token:
+    description: 'GitHub token for API access'
+    required: true
+  repo-owner:
+    description: 'Repository owner'
+    required: true
+  repo-name:
+    description: 'Repository name'
+    required: true
+  pr-number:
+    description: 'Pull request number'
+    required: true
+  review-file:
+    description: 'Path to JSON file with review data'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install unidiff==0.7.5
+
+    - name: Post inline review
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        python3 "${{ github.action_path }}/gh_review_tool.py" \
+          "${{ inputs.repo-owner }}" \
+          "${{ inputs.repo-name }}" \
+          "${{ inputs.pr-number }}" \
+          "${{ inputs.review-file }}"

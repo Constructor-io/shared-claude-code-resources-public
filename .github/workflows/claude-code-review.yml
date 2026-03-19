@@ -6,10 +6,10 @@ on:
     types: [opened, ready_for_review, synchronize]
   workflow_call: # to allow other workflows to call this workflow
     inputs:
-      hide_previous_comments:
-        description: 'Hide previous bot review comments before posting new one'
-        type: boolean
-        default: false
+      pr_number:
+        description: 'PR number to review (defaults to github.event.pull_request.number)'
+        type: number
+        required: false
 
 # Prevent multiple simultaneous reviews on same PR
 # If a new commit is pushed while review is running, cancel the old review and start fresh
@@ -30,11 +30,12 @@ jobs:
       github.event.pull_request.user.type != 'Bot' &&
       github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       AWS_REGION: us-east-1
     permissions:
       contents: read # Read repository files
-      pull-requests: read # Read PR metadata and diffs
+      pull-requests: write # Read PR metadata/diffs and post reviews (inline comments require write)
       issues: read # Read linked issues (PRs are issues in GitHub API)
       id-token: write # Generate OIDC token for secure authentication
       actions: read # Read CI/CD workflow results on PRs
@@ -55,19 +56,65 @@ jobs:
           aws-iam-role: ${{ secrets.CLAUDE_BEDROCK_IAM_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Hide previous review comments
-        if: ${{ inputs.hide_previous_comments == true }}
+      - name: Resolve previous review threads
         env:
           GH_TOKEN: ${{ steps.auth.outputs.github-token }}
         run: |
           BOT_LOGIN="constructor-claude-bedrock"
-          echo "Looking for comments from: $BOT_LOGIN"
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+          PR_NUMBER="${{ inputs.pr_number || github.event.pull_request.number }}"
 
-          COMMENTS=$(gh api graphql -f query='
+          # Resolve all unresolved review threads from the bot
+          echo "Resolving previous review threads from: $BOT_LOGIN"
+
+          THREAD_IDS=$(gh api graphql -f query='
             query($owner: String!, $repo: String!, $number: Int!) {
               repository(owner: $owner, name: $repo) {
                 pullRequest(number: $number) {
-                  comments(first: 100) {
+                  reviewThreads(first: 100) {
+                    nodes {
+                      id
+                      isResolved
+                      comments(first: 1) {
+                        nodes {
+                          author { login }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ' -f owner="$OWNER" \
+            -f repo="$REPO" \
+            -F number="$PR_NUMBER" \
+            --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .comments.nodes[0].author.login == "'"$BOT_LOGIN"'") | .id')
+
+          if [ -z "$THREAD_IDS" ]; then
+            echo "No previous review threads to resolve"
+          else
+            for THREAD_ID in $THREAD_IDS; do
+              echo "Resolving thread: $THREAD_ID"
+              gh api graphql -f query='
+                mutation($id: ID!) {
+                  resolveReviewThread(input: { threadId: $id }) {
+                    thread { isResolved }
+                  }
+                }
+              ' -f id="$THREAD_ID" || echo "Warning: Failed to resolve thread $THREAD_ID"
+            done
+            echo "Finished resolving previous review threads"
+          fi
+
+          # Minimize the top-level review bodies from the bot
+          echo "Minimizing previous review bodies from: $BOT_LOGIN"
+
+          REVIEW_IDS=$(gh api graphql -f query='
+            query($owner: String!, $repo: String!, $number: Int!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                  reviews(first: 100) {
                     nodes {
                       id
                       author { login }
@@ -77,29 +124,28 @@ jobs:
                 }
               }
             }
-          ' -f owner='${{ github.repository_owner }}' \
-            -f repo='${{ github.event.repository.name }}' \
-            -F number=${{ github.event.pull_request.number }} \
-            --jq ".data.repository.pullRequest.comments.nodes[] | select(.author.login == \"$BOT_LOGIN\" and .isMinimized == false) | .id")
+          ' -f owner="$OWNER" \
+            -f repo="$REPO" \
+            -F number="$PR_NUMBER" \
+            --jq '.data.repository.pullRequest.reviews.nodes[] | select(.author.login == "'"$BOT_LOGIN"'" and .isMinimized == false) | .id')
 
-          if [ -z "$COMMENTS" ]; then
-            echo "No previous comments to hide"
-            exit 0
+          if [ -z "$REVIEW_IDS" ]; then
+            echo "No previous reviews to minimize"
+          else
+            for REVIEW_ID in $REVIEW_IDS; do
+              echo "Minimizing review: $REVIEW_ID"
+              gh api graphql -f query='
+                mutation($id: ID!) {
+                  minimizeComment(input: { subjectId: $id, classifier: OUTDATED }) {
+                    minimizedComment { isMinimized }
+                  }
+                }
+              ' -f id="$REVIEW_ID" || echo "Warning: Failed to minimize review $REVIEW_ID"
+            done
+            echo "Finished minimizing previous reviews"
           fi
 
-          for COMMENT_ID in $COMMENTS; do
-            echo "Minimizing comment: $COMMENT_ID"
-            gh api graphql -f query='
-              mutation($id: ID!) {
-                minimizeComment(input: { subjectId: $id, classifier: OUTDATED }) {
-                  minimizedComment { isMinimized }
-                }
-              }
-            ' -f id="$COMMENT_ID" || echo "Warning: Failed to minimize $COMMENT_ID"
-          done
-
-          echo "Finished hiding previous comments"
-
+      # Run Claude review and output to JSON for inline comments
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@f30f5eecfce2f34fa72e40fa5f7bcdbdcad12eb8 # v1
@@ -116,7 +162,7 @@ jobs:
 
             <context>
             - Repository: ${{ github.repository }}
-            - PR number: ${{ github.event.pull_request.number }}
+            - PR number: ${{ inputs.pr_number || github.event.pull_request.number }}
             - Use `gh pr view` to get PR details if needed
             - Use `gh pr diff` to get the diff of the PR and identify all the changed files for the analysis.
             </context>
@@ -135,24 +181,89 @@ jobs:
             </instructions>
 
             <output_format>
-            You MUST deliver your complete review as a single comment on the pull request using the `gh pr comment` tool.
+            Create a JSON file at /tmp/review_data.json with the following structure:
 
-            If a different output format is requested in the `.claude/commands/review.md` file, follow that structure. If not structure your review using the following markdown format:
+            {
+              "body": "<short review summary>",
+              "comments": [
+                {
+                  "file": "path/to/file.extension",
+                  "line": <line_number>,
+                  "body": "Comment text with **markdown** support"
+                }
+              ]
+            }
 
-            ### Code Review Summary
-            A brief, high-level overview of the pull request and your findings.
+            - "body" should be SHORT (3-5 lines) since detailed feedback goes in inline comments
+            - Use this format for body:
+              ## Code Review
+              **Changes reviewed:** [Brief description of what was reviewed]
+              **Files reviewed:** [List key files]
 
-            ### Detailed Feedback
-            - **[File: `path/to/file.js` Line: `L15`]** A specific, actionable comment about a line of code.
-            - **[General]** A comment that applies to the PR as a whole.
+              | Category | Count |
+              |----------|-------|
+              | Critical | X |
+              | Suggestions | X |
+              | Nitpicks | X |
 
-            ### Conclusion
-            A final closing statement.
+              **Overall Assessment:** [✅ Pass / ⚠️ Needs Work / ❌ Critical Issues]
+            - Put ALL detailed feedback in the "comments" array
+
+            Guidelines for "comments" array:
+            * Each inline comment should have:
+              - "file": The full file path relative to repository root
+              - "line": A specific line number in the PR diff (must be a changed/added line)
+              - "body": Clear, actionable feedback with markdown formatting
+            * Prefix each comment body with a severity emoji:
+              - 🔴 Critical: bugs, security issues, data loss risks
+              - 🟡 Suggestion: improvements, better patterns, performance
+              - 🔵 Nitpick: style, naming, minor improvements
+            * IMPORTANT: The "line" must be a line that appears in the diff as added or modified.
+              If your comment is about a deleted line, put it on the nearest added/modified line instead.
+            * If you have no comments, set "comments" to an empty array.
+
+            IMPORTANT: Write this file using bash, e.g.:
+            cat > /tmp/review_data.json << 'REVIEW_JSON'
+            { ... your JSON here ... }
+            REVIEW_JSON
             </output_format>
 
-            You MUST deliver your complete review as a single comment on the pull request using the `gh pr comment` tool. Only use this method and no other method.
-
           # Restrict Claude's tool access for security - only allow read-only GitHub/git commands
-          # Allows: viewing PRs/issues, reading diffs, and posting comments
+          # Allows: viewing PRs/issues, reading diffs, and writing review JSON
           # Prevents: modifying code, merging PRs, or running arbitrary commands
-          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(git log:*),Bash(git diff:*)"'
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(git log:*),Bash(git diff:*),Bash(cat > /tmp/review_data.json*)"'
+
+      - name: Check Review Output
+        id: check-review
+        if: ${{ steps.claude-review.outcome == 'success' }}
+        run: |
+          if [ ! -f /tmp/review_data.json ]; then
+            echo "review_missing=true" >> $GITHUB_OUTPUT
+            echo "Warning: Claude did not produce /tmp/review_data.json"
+          else
+            echo "review_missing=false" >> $GITHUB_OUTPUT
+            echo "Review data found:"
+            cat /tmp/review_data.json | head -50
+          fi
+
+      # Post inline comments using the composite action
+      - name: Post Inline Review
+        if: ${{ steps.claude-review.outcome == 'success' && steps.check-review.outputs.review_missing != 'true' }}
+        uses: Constructor-io/shared-claude-code-resources-public/.github/actions/post-inline-review@main
+        with:
+          github-token: ${{ steps.auth.outputs.github-token }}
+          repo-owner: ${{ github.repository_owner }}
+          repo-name: ${{ github.event.repository.name }}
+          pr-number: ${{ inputs.pr_number || github.event.pull_request.number }}
+          review-file: /tmp/review_data.json
+
+      # Fallback if Claude didn't produce the expected JSON file
+      - name: Post Review (fallback)
+        if: ${{ steps.check-review.outputs.review_missing == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.auth.outputs.github-token }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        run: |
+          echo "Claude review did not produce the expected JSON output file."
+          echo "The review may have been posted directly as a comment by Claude."
+          echo "Check the PR for any review comments."
