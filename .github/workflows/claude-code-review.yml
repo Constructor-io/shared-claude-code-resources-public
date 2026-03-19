@@ -188,8 +188,9 @@ jobs:
               "comments": [
                 {
                   "file": "path/to/file.extension",
-                  "line": <line_number>,
-                  "body": "Comment text with **markdown** support"
+                  "search_line": "<exact line content from diff>",
+                  "body": "**Critical Issue**: Your detailed feedback here",
+                  "search_type": "added"
                 }
               ]
             }
@@ -197,14 +198,10 @@ jobs:
             - "body" should be SHORT (3-5 lines) since detailed feedback goes in inline comments
             - Use this format for body:
               ## Code Review
-              **Changes reviewed:** [Brief description of what was reviewed]
-              **Files reviewed:** [List key files]
 
-              | Category | Count |
-              |----------|-------|
-              | Critical | X |
-              | Suggestions | X |
-              | Nitpicks | X |
+              [One sentence summarizing what the PR does and your overall impression]
+
+              **Inline comments:** [N] discussions added
 
               **Overall Assessment:** [✅ Pass / ⚠️ Needs Work / ❌ Critical Issues]
             - Put ALL detailed feedback in the "comments" array
@@ -212,38 +209,25 @@ jobs:
             Guidelines for "comments" array:
             * Each inline comment should have:
               - "file": The full file path relative to repository root
-              - "line": A specific line number in the PR diff (must be a changed/added line)
-              - "body": Clear, actionable feedback with markdown formatting
-            * Prefix each comment body with a severity emoji:
-              - 🔴 Critical: bugs, security issues, data loss risks
-              - 🟡 Suggestion: improvements, better patterns, performance
-              - 🔵 Nitpick: style, naming, minor improvements
-            * IMPORTANT: The "line" must be a line that appears in the diff as added or modified.
-              If your comment is about a deleted line, put it on the nearest added/modified line instead.
-            * If you have no comments, set "comments" to an empty array.
-
-            IMPORTANT: Write this file using bash, e.g.:
-            cat > /tmp/review_data.json << 'REVIEW_JSON'
-            { ... your JSON here ... }
-            REVIEW_JSON
+              - "search_line": The exact line content to search for (without +/- prefix)
+              - "body": Your feedback prefixed with severity (**Critical Issue**, **Important Issue**, or **Suggestion**)
+              - "search_type": One of "added" (for + lines), "deleted" (for - lines), "context" (for unchanged lines), or "any"
+            * ALWAYS include both "body" and "comments" fields
+            * If no inline comments are needed, use an empty array: "comments": []
+            * If a different output format is requested in `.claude/commands/review.md`, follow that structure
             </output_format>
 
           # Restrict Claude's tool access for security - only allow read-only GitHub/git commands
-          # Allows: viewing PRs/issues, reading diffs, and writing review JSON
-          # Prevents: modifying code, merging PRs, or running arbitrary commands
-          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(git log:*),Bash(git diff:*),Bash(cat > /tmp/review_data.json*)"'
+          # plus tools needed to create the review JSON file
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git branch:*),Bash(git show-ref:*),Read,Write,Grep,Glob,Bash(cat:*),Bash(ls:*),Bash(find:*)"'
 
-      - name: Check Review Output
+      # Check if review data was generated
+      - name: Check review data
         id: check-review
         if: ${{ steps.claude-review.outcome == 'success' }}
         run: |
           if [ ! -f /tmp/review_data.json ]; then
-            echo "review_missing=true" >> $GITHUB_OUTPUT
-            echo "Warning: Claude did not produce /tmp/review_data.json"
-          else
-            echo "review_missing=false" >> $GITHUB_OUTPUT
-            echo "Review data found:"
-            cat /tmp/review_data.json | head -50
+            echo "review_missing=true" >> "$GITHUB_OUTPUT"
           fi
 
       # Post inline comments using the composite action
@@ -264,6 +248,9 @@ jobs:
           GH_TOKEN: ${{ steps.auth.outputs.github-token }}
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         run: |
-          echo "Claude review did not produce the expected JSON output file."
-          echo "The review may have been posted directly as a comment by Claude."
-          echo "Check the PR for any review comments."
+          echo "::warning::No review data file found, posting fallback comment"
+          gh pr comment "$PR_NUMBER" --body "## Code Review
+
+          Claude completed the review but failed to generate the review JSON file. Please check the workflow logs for details.
+
+          **Overall Assessment:** ⚠️ Review incomplete"
