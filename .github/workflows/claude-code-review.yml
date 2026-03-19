@@ -231,7 +231,7 @@ jobs:
           # Restrict Claude's tool access for security - only allow read-only GitHub/git commands
           # Allows: viewing PRs/issues, reading diffs, and writing review JSON
           # Prevents: modifying code, merging PRs, or running arbitrary commands
-          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(git log:*),Bash(git diff:*),Bash(cat > /tmp/review_data.json*)"'
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git branch:*),Bash(git show-ref:*),Read,Write,Grep,Glob,Bash(cat:*),Bash(ls:*),Bash(find:*)"'
 
       - name: Check Review Output
         id: check-review
